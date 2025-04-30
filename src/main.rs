@@ -63,8 +63,9 @@ impl Point3D {
     }
 
     fn normalize(&self) -> Self {
+        const EPSILON: f64 = 1e-10;
         let length = f64::sqrt(self.x * self.x + self.y * self.y + self.z * self.z);
-        if length == 0.0 {
+        if length < EPSILON {
             return Self::new(0.0, 0.0, 0.0);
         }
         Self::new(self.x / length, self.y / length, self.z / length)
@@ -405,6 +406,12 @@ impl CrabModel {
 
             let x = x2d as usize;
             let y = y2d as usize;
+            
+            // Additional safety check
+            if x >= WIDTH || y >= HEIGHT {
+                continue;
+            }
+            
             let idx = y * WIDTH + x;
 
             if idx >= z_buffer.len() {
@@ -448,6 +455,12 @@ impl CrabModel {
 
             let x = x2d as usize;
             let y = y2d as usize;
+            
+            // Additional safety check
+            if x >= WIDTH || y >= HEIGHT {
+                continue;
+            }
+            
             let idx = y * WIDTH + x;
 
             if idx >= z_buffer.len() {
@@ -488,6 +501,12 @@ impl CrabModel {
 
                 let x = x2d as usize;
                 let y = y2d as usize;
+                
+                // Additional safety check
+                if x >= WIDTH || y >= HEIGHT {
+                    continue;
+                }
+                
                 let idx = y * WIDTH + x;
 
                 if idx >= z_buffer.len() {
@@ -537,6 +556,12 @@ impl CrabModel {
 
                 let x = x2d as usize;
                 let y = y2d as usize;
+                
+                // Additional safety check
+                if x >= WIDTH || y >= HEIGHT {
+                    continue;
+                }
+                
                 let idx = y * WIDTH + x;
 
                 if idx >= z_buffer.len() {
@@ -629,9 +654,13 @@ fn main() -> io::Result<()> {
     // Set up terminal
     let mut stdout = io::stdout();
     let mut frame_count: f64 = 0.0;
+    let frame_duration = Duration::from_millis(50);
+    let frame_increment = 0.1;
 
     // Animation loop
     loop {
+        let start_time = std::time::Instant::now();
+
         // Clear the screen (ANSI escape code)
         print!("\x1B[2J\x1B[1;1H");
 
@@ -642,15 +671,13 @@ fn main() -> io::Result<()> {
         stdout.write_all(output.as_bytes())?;
         stdout.flush()?;
 
-        // Sleep for animation smoothness
-        thread::sleep(Duration::from_millis(50));
+        // Calculate elapsed time and sleep for consistent frame rate
+        let elapsed = start_time.elapsed();
+        if elapsed < frame_duration {
+            thread::sleep(frame_duration - elapsed);
+        }
 
         // Update frame counter
-        frame_count += 0.1;
-
-        // Optional: Break condition (uncomment if needed)
-        // if frame_count > 1000.0 {
-        //     break;
-        // }
+        frame_count += frame_increment;
     }
 }
