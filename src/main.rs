@@ -205,10 +205,34 @@ impl CrabModel {
 
             points.push(Point3D::new(x, y, z));
 
-            // Approximate normal (not perfect but works for shading)
-            let dx = if i < segments { points[i+1].x - points[i].x } else { points[i].x - points[i-1].x };
-            let dy = if i < segments { points[i+1].y - points[i].y } else { points[i].y - points[i-1].y };
-            let dz = if i < segments { points[i+1].z - points[i].z } else { points[i].z - points[i-1].z };
+            // Calculate normal based on the curve direction
+            let dx = if i < segments {
+                // Use next point for direction
+                let next_x = (1.0 - (t + 1.0/segments as f64)) * ax + (t + 1.0/segments as f64) * bx;
+                let next_y = (1.0 - (t + 1.0/segments as f64)) * ay + (t + 1.0/segments as f64) * by;
+                let next_z = (1.0 - (t + 1.0/segments as f64)) * az + (t + 1.0/segments as f64) * bz;
+                next_x - x
+            } else {
+                // For the last point, use the previous direction
+                let prev_x = (1.0 - (t - 1.0/segments as f64)) * ax + (t - 1.0/segments as f64) * bx;
+                x - prev_x
+            };
+
+            let dy = if i < segments {
+                let next_y = (1.0 - (t + 1.0/segments as f64)) * ay + (t + 1.0/segments as f64) * by;
+                next_y - y
+            } else {
+                let prev_y = (1.0 - (t - 1.0/segments as f64)) * ay + (t - 1.0/segments as f64) * by;
+                y - prev_y
+            };
+
+            let dz = if i < segments {
+                let next_z = (1.0 - (t + 1.0/segments as f64)) * az + (t + 1.0/segments as f64) * bz;
+                next_z - z
+            } else {
+                let prev_z = (1.0 - (t - 1.0/segments as f64)) * az + (t - 1.0/segments as f64) * bz;
+                z - prev_z
+            };
 
             // Create a normal perpendicular to the leg direction
             let leg_dir = Point3D::new(dx, dy, dz).normalize();
