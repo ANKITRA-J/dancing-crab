@@ -89,7 +89,7 @@ struct CrabModel {
 }
 
 impl CrabModel {
-    fn new() -> Self {
+    fn new() -> Result<Self, &'static str> {
         let mut crab = Self {
             body_points: Vec::new(),
             body_normals: Vec::new(),
@@ -100,14 +100,14 @@ impl CrabModel {
             eye_points: Vec::new(),
             eye_normals: Vec::new(),
         };
-        crab.generate_body();
-        crab.generate_legs();
-        crab.generate_claws();
-        crab.generate_eyes();
-        crab
+        crab.generate_body()?;
+        crab.generate_legs()?;
+        crab.generate_claws()?;
+        crab.generate_eyes()?;
+        Ok(crab)
     }
 
-    fn generate_body(&mut self) {
+    fn generate_body(&mut self) -> Result<(), &'static str> {
         // Generate crab shell (similar to torus but modified for crab shape)
         for i in 0..SHELL_SEGMENTS {
             let phi = 2.0 * PI * i as f64 / SHELL_SEGMENTS as f64;
@@ -140,9 +140,10 @@ impl CrabModel {
                 self.body_normals.push(Point3D::new(nx, ny, nz).normalize());
             }
         }
+        Ok(())
     }
 
-    fn generate_legs(&mut self) {
+    fn generate_legs(&mut self) -> Result<(), &'static str> {
         // Generate 4 pairs of legs
         for leg_pair in 0..4 {
             let angle_offset = (leg_pair as f64 - 1.5) * PI / 10.0;
@@ -150,20 +151,21 @@ impl CrabModel {
             // Left leg
             let mut left_leg_points = Vec::new();
             let mut left_leg_normals = Vec::new();
-            self.generate_leg(&mut left_leg_points, &mut left_leg_normals, -1.0, angle_offset);
+            self.generate_leg(&mut left_leg_points, &mut left_leg_normals, -1.0, angle_offset)?;
             self.leg_points.push(left_leg_points);
             self.leg_normals.push(left_leg_normals);
 
             // Right leg
             let mut right_leg_points = Vec::new();
             let mut right_leg_normals = Vec::new();
-            self.generate_leg(&mut right_leg_points, &mut right_leg_normals, 1.0, angle_offset);
+            self.generate_leg(&mut right_leg_points, &mut right_leg_normals, 1.0, angle_offset)?;
             self.leg_points.push(right_leg_points);
             self.leg_normals.push(right_leg_normals);
         }
+        Ok(())
     }
 
-    fn generate_leg(&self, points: &mut Vec<Point3D>, normals: &mut Vec<Point3D>, side: f64, angle_offset: f64) {
+    fn generate_leg(&self, points: &mut Vec<Point3D>, normals: &mut Vec<Point3D>, side: f64, angle_offset: f64) -> Result<(), &'static str> {
         let base_angle = if side < 0.0 { PI } else { 0.0 } + angle_offset;
         let leg_length = 16.0;
         let segments = LEG_SEGMENTS;
@@ -209,8 +211,6 @@ impl CrabModel {
             let dx = if i < segments {
                 // Use next point for direction
                 let next_x = (1.0 - (t + 1.0/segments as f64)) * ax + (t + 1.0/segments as f64) * bx;
-                let next_y = (1.0 - (t + 1.0/segments as f64)) * ay + (t + 1.0/segments as f64) * by;
-                let next_z = (1.0 - (t + 1.0/segments as f64)) * az + (t + 1.0/segments as f64) * bz;
                 next_x - x
             } else {
                 // For the last point, use the previous direction
@@ -245,25 +245,27 @@ impl CrabModel {
 
             normals.push(normal);
         }
+        Ok(())
     }
 
-    fn generate_claws(&mut self) {
+    fn generate_claws(&mut self) -> Result<(), &'static str> {
         // Generate left claw
         let mut left_claw_points = Vec::new();
         let mut left_claw_normals = Vec::new();
-        self.generate_claw(&mut left_claw_points, &mut left_claw_normals, -1.0);
+        self.generate_claw(&mut left_claw_points, &mut left_claw_normals, -1.0)?;
         self.claw_points.push(left_claw_points);
         self.claw_normals.push(left_claw_normals);
 
         // Generate right claw
         let mut right_claw_points = Vec::new();
         let mut right_claw_normals = Vec::new();
-        self.generate_claw(&mut right_claw_points, &mut right_claw_normals, 1.0);
+        self.generate_claw(&mut right_claw_points, &mut right_claw_normals, 1.0)?;
         self.claw_points.push(right_claw_points);
         self.claw_normals.push(right_claw_normals);
+        Ok(())
     }
 
-    fn generate_claw(&self, points: &mut Vec<Point3D>, normals: &mut Vec<Point3D>, side: f64) {
+    fn generate_claw(&self, points: &mut Vec<Point3D>, normals: &mut Vec<Point3D>, side: f64) -> Result<(), &'static str> {
         let base_angle = if side < 0.0 { PI * 0.8 } else { PI * 0.2 };
         let claw_length = 20.0;
         let segments = CLAW_SEGMENTS;
@@ -340,9 +342,10 @@ impl CrabModel {
                 }
             }
         }
+        Ok(())
     }
 
-    fn generate_eyes(&mut self) {
+    fn generate_eyes(&mut self) -> Result<(), &'static str> {
         // Two eyes on top of the crab
         let eye_distance = 4.0;
 
@@ -371,6 +374,7 @@ impl CrabModel {
                 }
             }
         }
+        Ok(())
     }
 
     // Added render function to fix missing implementation
@@ -379,14 +383,79 @@ impl CrabModel {
         let mut output_buffer = vec![' '; buffer_size];
         let mut z_buffer = vec![0.0; buffer_size];
 
-        self.animate(frame, &mut z_buffer, &mut output_buffer);
+        // Clear buffers
+        output_buffer.fill(' ');
+        z_buffer.fill(0.0);
+
+        // Create an animated light direction that moves slightly
+        let light_x = LIGHT_DIRECTION[0];
+        let light_y = LIGHT_DIRECTION[1] * f64::cos(frame * 0.1) - LIGHT_DIRECTION[2] * f64::sin(frame * 0.1);
+        let light_z = LIGHT_DIRECTION[1] * f64::sin(frame * 0.1) + LIGHT_DIRECTION[2] * f64::cos(frame * 0.1);
+        let light_dir = Point3D::new(light_x, light_y, light_z).normalize();
+
+        // Dance animation parameters
+        let bounce = f64::sin(frame * 0.8) * 2.0;
+        let spin = frame * 0.3;
+        let _claw_wave = f64::sin(frame * 1.2) * 0.15; // Used in claw animation
+        let _leg_wave = frame * 2.0; // Used in leg animation
+
+        // Render body
+        for (i, point) in self.body_points.iter().enumerate() {
+            let mut p = *point;
+
+            // Apply rotations
+            p.rotate_y(spin);
+            p.rotate_x(f64::sin(frame * 0.2) * 0.1);
+            p.rotate_z(f64::cos(frame * 0.3) * 0.05);
+
+            // Apply bounce
+            p.y += bounce;
+
+            let (x2d, y2d, z) = p.project();
+            if z < 0.0 || x2d < 0.0 || x2d >= WIDTH as f64 || y2d < 0.0 || y2d >= HEIGHT as f64 {
+                continue;
+            }
+
+            let x = x2d as usize;
+            let y = y2d as usize;
+            
+            // Additional safety check
+            if x >= WIDTH || y >= HEIGHT {
+                continue;
+            }
+            
+            let idx = y * WIDTH + x;
+            if idx >= buffer_size {
+                continue;
+            }
+
+            if z_buffer[idx] == 0.0 || z < z_buffer[idx] {
+                // Calculate luminance based on normal and light direction
+                let mut normal = self.body_normals[i];
+                normal.rotate_y(spin);
+                normal.rotate_x(f64::sin(frame * 0.2) * 0.1);
+                normal.rotate_z(f64::cos(frame * 0.3) * 0.05);
+
+                let luminance = normal.dot(&light_dir);
+
+                if luminance > 0.0 {
+                    z_buffer[idx] = z;
+                    let lum_idx = (luminance * (SHADE_CHARS.len() - 1) as f64).round() as usize;
+                    if lum_idx < SHADE_CHARS.len() {
+                        output_buffer[idx] = SHADE_CHARS.chars().nth(lum_idx).unwrap_or('@');
+                    }
+                }
+            }
+        }
 
         // Convert the buffer to a string
-        let mut output = String::new();
+        let mut output = String::with_capacity(buffer_size + HEIGHT); // +HEIGHT for newlines
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
                 let idx = y * WIDTH + x;
-                output.push(output_buffer[idx]);
+                if idx < buffer_size {
+                    output.push(output_buffer[idx]);
+                }
             }
             output.push('\n');
         }
@@ -673,7 +742,13 @@ impl CrabModel {
 
 fn main() -> io::Result<()> {
     // Create the crab model
-    let crab = CrabModel::new();
+    let crab = match CrabModel::new() {
+        Ok(crab) => crab,
+        Err(e) => {
+            eprintln!("Failed to create crab model: {}", e);
+            return Err(io::Error::new(io::ErrorKind::Other, "Failed to create crab model"));
+        }
+    };
 
     // Set up terminal
     let mut stdout = io::stdout();
@@ -692,8 +767,14 @@ fn main() -> io::Result<()> {
         let output = crab.render(frame_count);
 
         // Print the frame
-        stdout.write_all(output.as_bytes())?;
-        stdout.flush()?;
+        if let Err(e) = stdout.write_all(output.as_bytes()) {
+            eprintln!("Failed to write to stdout: {}", e);
+            return Err(e);
+        }
+        if let Err(e) = stdout.flush() {
+            eprintln!("Failed to flush stdout: {}", e);
+            return Err(e);
+        }
 
         // Calculate elapsed time and sleep for consistent frame rate
         let elapsed = start_time.elapsed();
@@ -703,5 +784,13 @@ fn main() -> io::Result<()> {
 
         // Update frame counter
         frame_count += frame_increment;
+
+        // Add a way to exit the program (Ctrl+C will work, but this is more graceful)
+        if frame_count > 1000.0 {
+            println!("\nAnimation completed!");
+            break;
+        }
     }
+
+    Ok(())
 }
