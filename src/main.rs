@@ -1,3 +1,4 @@
+mod display;
 mod render;
 
 use std::io::{self, IsTerminal, Write};
@@ -7,25 +8,27 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
-    style::{Color, ResetColor, SetForegroundColor},
+    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use display::{compose, Cell, Style};
 use render::Renderer;
 
-const HELP: &str = "Dancing Crab - a shaded 3D ASCII crab in your terminal
+const HELP: &str = "Dancing Crab - a shaded 3D crab in your terminal
 
 Usage: dancing-crab [OPTIONS]
 
-  --snapshot        Print one plain ASCII frame and exit
+  --style STYLE     ascii (classic symbols) or smooth (finer Unicode dots)
+  --snapshot        Print one plain frame in the selected style and exit
   --no-color        Disable orange terminal colors (also respects NO_COLOR)
   --time SECONDS    Starting animation time (default: 0)
   --width COLUMNS   Canvas width, 20..400 (default: fit terminal, or 100)
   --height ROWS     Canvas height, 8..120 (default: fit terminal, or 32)
-  --fps FPS         Frames per second, 1..120 (default: 30)
+  --fps FPS         Frames per second, 1..120 (default: 60)
   --frames COUNT    Exit after this many frames
   -h, --help        Show this help
 
-Controls: Space pauses; Q, Esc, or Ctrl+C quits.
+Controls: M switches styles; Space pauses; Q, Esc, or Ctrl+C quits.
 When output or input is not a terminal, print one plain frame by default.
 ";
 
@@ -33,6 +36,7 @@ When output or input is not a terminal, print one plain frame by default.
 struct Options {
     snapshot: bool,
     no_color: bool,
+    style: Style,
     time: f64,
     width: Option<usize>,
     height: Option<usize>,
@@ -45,10 +49,11 @@ impl Default for Options {
         Self {
             snapshot: false,
             no_color: false,
+            style: Style::Ascii,
             time: 0.0,
             width: None,
             height: None,
-            fps: 30,
+            fps: 60,
             frames: None,
         }
     }
@@ -71,12 +76,13 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Option
         }
         if !matches!(
             arg.as_str(),
-            "--time" | "--width" | "--height" | "--fps" | "--frames"
+            "--style" | "--time" | "--width" | "--height" | "--fps" | "--frames"
         ) {
             return Err(format!("Unknown option: {arg}. Use --help for usage."));
         }
         let value = args.next().ok_or_else(|| format!("{arg} needs a value"))?;
         match arg.as_str() {
+            "--style" => options.style = Style::parse(&value)?,
             "--time" => {
                 let time: f64 = value.parse().map_err(|_| "--time needs a number")?;
                 if !time.is_finite() || time < 0.0 {
@@ -132,43 +138,46 @@ fn write_line(out: &mut impl Write, row: u16, text: &str, columns: u16) -> io::R
     queue!(out, Clear(ClearType::UntilNewLine))
 }
 
-fn crab_color(cell: u8) -> Color {
-    let (r, g, b) = match cell {
-        b'O' | b'_' => (255, 244, 225),
-        b'o' => (90, 52, 37),
-        b'.' | b',' | b'-' | b'~' => (166, 57, 9),
-        b':' | b';' | b'=' => (215, 68, 8),
-        b'!' | b'*' | b'#' => (247, 76, 0),
-        b'$' | b'@' => (255, 151, 64),
-        _ => return Color::Reset,
-    };
-    Color::Rgb { r, g, b }
-}
-
-fn write_crab_line(
+fn write_crab_row(
     out: &mut impl Write,
     row: u16,
-    text: &str,
+    cells: &[Cell],
     columns: u16,
     color: bool,
 ) -> io::Result<()> {
-    if !color {
-        return write_line(out, row, text, columns);
-    }
     queue!(out, MoveTo(0, row))?;
-    let cells = &text.as_bytes()[..text.len().min(columns.saturating_sub(1) as usize)];
-    let mut start = 0;
-    while start < cells.len() {
-        let shade = crab_color(cells[start]);
-        let mut end = start + 1;
-        while end < cells.len() && crab_color(cells[end]) == shade {
-            end += 1;
+    let cells = &cells[..cells.len().min(columns.saturating_sub(1) as usize)];
+    let mut foreground = None;
+    let mut background = None;
+    let mut utf8 = [0; 4];
+    for cell in cells {
+        if color && cell.color != foreground {
+            let shade = match cell.color {
+                Some((r, g, b)) => Color::Rgb { r, g, b },
+                None => Color::Reset,
+            };
+            queue!(out, SetForegroundColor(shade))?;
+            foreground = cell.color;
         }
-        queue!(out, SetForegroundColor(shade))?;
-        out.write_all(&cells[start..end])?;
-        start = end;
+        if color && cell.background != background {
+            let shade = match cell.background {
+                Some((r, g, b)) => Color::Rgb { r, g, b },
+                None => Color::Reset,
+            };
+            queue!(out, SetBackgroundColor(shade))?;
+            background = cell.background;
+        }
+        out.write_all(cell.glyph.encode_utf8(&mut utf8).as_bytes())?;
     }
-    queue!(out, ResetColor, Clear(ClearType::UntilNewLine))
+    if color {
+        queue!(out, ResetColor)?;
+    }
+    queue!(out, Clear(ClearType::UntilNewLine))
+}
+
+fn renderer_for(style: Style, width: usize, height: usize) -> Renderer {
+    let (raster_width, raster_height, aspect) = style.raster_size(width, height);
+    Renderer::with_aspect(raster_width, raster_height, aspect)
 }
 
 fn animate(options: &Options) -> io::Result<()> {
@@ -186,7 +195,8 @@ fn animate(options: &Options) -> io::Result<()> {
     let mut last_tick = Instant::now();
     let mut paused = false;
     let mut rendered = 0;
-    let mut canvas = (0, 0);
+    let mut style = options.style;
+    let mut canvas = None;
     let mut renderer = Renderer::new(20, 8);
     loop {
         let started = Instant::now();
@@ -203,24 +213,26 @@ fn animate(options: &Options) -> io::Result<()> {
             .height
             .unwrap_or(120)
             .min(rows.saturating_sub(2) as usize);
-        if (width, height) != canvas {
+        if canvas != Some((width, height, style)) {
             execute!(out, Clear(ClearType::All))?;
-            renderer = Renderer::new(width, height);
-            canvas = (width, height);
+            renderer = renderer_for(style, width, height);
+            canvas = Some((width, height, style));
         }
         if width < 20 || height < 8 {
             write_line(&mut out, 0, "Resize terminal to at least 21 x 10", columns)?;
         } else {
             write_line(&mut out, 0, "D A N C I N G   C R A B", columns)?;
-            for (y, line) in renderer.render(time).lines().enumerate() {
-                write_crab_line(&mut out, y as u16 + 1, line, columns, color)?;
+            let frame = compose(style, &renderer.render(time), width, height);
+            for (y, cells) in frame.rows().enumerate() {
+                write_crab_row(&mut out, y as u16 + 1, cells, columns, color)?;
             }
-            let footer = if paused {
-                "PAUSED | Space: resume | Q / Esc / Ctrl+C: quit"
+            let playback = if paused {
+                format!("{} (PAUSED)", style.label())
             } else {
-                "Space: pause | Q / Esc / Ctrl+C: quit"
+                style.label().to_owned()
             };
-            write_line(&mut out, height as u16 + 1, footer, columns)?;
+            let footer = format!("{playback} | M: style | Space: pause | Q / Esc / Ctrl+C: quit");
+            write_line(&mut out, height as u16 + 1, &footer, columns)?;
         }
         out.flush()?;
         rendered += 1;
@@ -244,6 +256,7 @@ fn animate(options: &Options) -> io::Result<()> {
                             return Ok(());
                         }
                         KeyCode::Char(' ') => paused = !paused,
+                        KeyCode::Char('m' | 'M') => style.toggle(),
                         _ => {}
                     }
                 }
@@ -257,7 +270,9 @@ fn animate(options: &Options) -> io::Result<()> {
 }
 
 fn print_frames(options: &Options) -> io::Result<()> {
-    let mut renderer = Renderer::new(options.width.unwrap_or(100), options.height.unwrap_or(32));
+    let width = options.width.unwrap_or(100);
+    let height = options.height.unwrap_or(32);
+    let mut renderer = renderer_for(options.style, width, height);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let count = if options.snapshot {
@@ -270,7 +285,8 @@ fn print_frames(options: &Options) -> io::Result<()> {
             writeln!(out)?;
         }
         let time = options.time + frame as f64 / f64::from(options.fps);
-        writeln!(out, "{}", renderer.render(time))?;
+        let frame = compose(options.style, &renderer.render(time), width, height);
+        writeln!(out, "{}", frame.plain_text())?;
     }
     out.flush()
 }
@@ -321,6 +337,8 @@ mod tests {
             vec!["--frames", "0"],
             vec!["--width"],
             vec!["--unknown"],
+            vec!["--style", "invalid"],
+            vec!["--style"],
         ] {
             assert!(parse(&args).is_err(), "should reject {args:?}");
         }

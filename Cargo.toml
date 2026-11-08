@@ -2,7 +2,7 @@
 name = "dancing-crab"
 version = "0.1.0"
 edition = "2021"
-description = "A 3D ASCII art animation of a dancing crab in the terminal"
+description = "A dancing 3D crab in the terminal, with ASCII and smooth Unicode graphics"
 readme = "README.md"
 license = "MIT"
 keywords = ["ascii-art", "animation", "terminal", "graphics", "crab"]

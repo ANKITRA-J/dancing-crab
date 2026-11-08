@@ -1,9 +1,9 @@
-//! A small software renderer: sampled surfaces, perspective, a depth buffer and light.
+//! A small software renderer: analytic surfaces, perspective, a depth buffer and light.
 //!
 //! Coordinates use +y upwards and -z towards the viewer. Terminal characters are
-//! roughly twice as tall as they are wide, so projection halves the vertical scale.
+//! roughly twice as tall as they are wide; square subpixels use an aspect of one.
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::PI;
 
 const SHADES: &[u8] = b".,-~:;=!*#$@";
 
@@ -33,14 +33,6 @@ impl Vec3 {
 
     fn dot(self, other: Self) -> f64 {
         self.x * other.x + self.y * other.y + self.z * other.z
-    }
-
-    fn cross(self, other: Self) -> Self {
-        Self::new(
-            self.y * other.z - self.z * other.y,
-            self.z * other.x - self.x * other.z,
-            self.x * other.y - self.y * other.x,
-        )
     }
 
     fn length(self) -> f64 {
@@ -73,6 +65,14 @@ impl Pose {
         }
     }
 
+    fn unrotate(self, point: Vec3) -> Vec3 {
+        let (sy, cy) = self.yaw;
+        let (sr, cr) = self.roll;
+        let x = point.x * cr + point.y * sr;
+        let y = -point.x * sr + point.y * cr;
+        Vec3::new(x * cy - point.z * sy, y, x * sy + point.z * cy)
+    }
+
     fn rotate(self, point: Vec3) -> Vec3 {
         let (sy, cy) = self.yaw;
         let (sr, cr) = self.roll;
@@ -85,6 +85,9 @@ impl Pose {
 #[derive(Clone, Copy)]
 enum Material {
     Shell,
+    Rim,
+    Underside,
+    Groove,
     Eye,
     Pupil,
     ClosedEye,
@@ -95,6 +98,7 @@ pub struct Renderer {
     width: usize,
     height: usize,
     scale: f64,
+    vertical_scale: f64,
     pixels: Vec<u8>,
     depth: Vec<f64>,
     pose: Pose,
@@ -103,11 +107,22 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(width: usize, height: usize) -> Self {
+        Self::with_aspect(width, height, 0.5)
+    }
+
+    /// Use 0.5 for terminal characters, or 1.0 for square subpixels.
+    pub fn with_aspect(width: usize, height: usize, vertical_scale: f64) -> Self {
+        let vertical_scale = if vertical_scale.is_finite() && vertical_scale > 0.0 {
+            vertical_scale
+        } else {
+            0.5
+        };
         Self {
             width,
             height,
             scale: ((width.saturating_sub(2) as f64) / 20.5)
-                .min((height.saturating_sub(2) as f64) * 2.0 / 12.0),
+                .min((height.saturating_sub(2) as f64) / (12.0 * vertical_scale)),
+            vertical_scale,
             pixels: vec![b' '; width * height],
             depth: vec![f64::INFINITY; width * height],
             pose: Pose::dancing(0.0),
@@ -141,27 +156,24 @@ impl Renderer {
         frame
     }
 
-    fn plot(&mut self, point: Vec3, normal: Vec3, material: Material) {
-        let point = self.pose.rotate(point).plus(self.pose.offset);
-        let depth = point.z + 28.0;
-        if depth <= 1.0 || !depth.is_finite() {
-            return;
-        }
-        let perspective = 28.0 / depth;
-        let x = (self.width as f64 * 0.5 + point.x * self.scale * perspective).round();
-        let y =
-            (self.height as f64 * 0.5 - (point.y - 0.9) * self.scale * 0.5 * perspective).round();
-        if x < 0.0 || y < 0.0 || x >= self.width as f64 || y >= self.height as f64 {
-            return;
-        }
-        let index = y as usize * self.width + x as usize;
-        if depth >= self.depth[index] {
+    fn store(&mut self, index: usize, depth: f64, normal: Vec3, material: Material) {
+        if depth <= 1.0 || !depth.is_finite() || depth >= self.depth[index] {
             return;
         }
         let shade = match material {
-            Material::Shell => {
-                let normal = self.pose.rotate(normal).normalized();
-                let brightness = 0.19 + 0.81 * normal.dot(self.light).max(0.0);
+            Material::Shell | Material::Rim | Material::Underside | Material::Groove => {
+                let diffuse = self
+                    .pose
+                    .rotate(normal)
+                    .normalized()
+                    .dot(self.light)
+                    .max(0.0);
+                let brightness = match material {
+                    Material::Rim => 0.32 + 0.68 * diffuse,
+                    Material::Underside => 0.12 + 0.45 * diffuse,
+                    Material::Groove => 0.08 + 0.10 * diffuse,
+                    _ => 0.19 + 0.81 * diffuse,
+                };
                 SHADES[(brightness * (SHADES.len() - 1) as f64).round() as usize]
             }
             Material::Eye => b'O',
@@ -172,124 +184,257 @@ impl Renderer {
         self.pixels[index] = shade;
     }
 
+    /// Conservative projected bounds of a world-space box.
+    fn bounds(&self, low: Vec3, high: Vec3) -> Option<(usize, usize, usize, usize)> {
+        if self.width == 0 || self.height == 0 || self.scale <= 0.0 {
+            return None;
+        }
+        let (mut left, mut right, mut top, mut bottom) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for x in [low.x, high.x] {
+            for y in [low.y, high.y] {
+                for z in [low.z, high.z] {
+                    let perspective = 28.0 / (z + 28.0).max(1.0);
+                    let sx = self.width as f64 * 0.5 + x * self.scale * perspective;
+                    let sy = self.height as f64 * 0.5
+                        - (y - 0.9) * self.scale * self.vertical_scale * perspective;
+                    left = left.min(sx);
+                    right = right.max(sx);
+                    top = top.min(sy);
+                    bottom = bottom.max(sy);
+                }
+            }
+        }
+        if right < 0.0 || bottom < 0.0 || left >= self.width as f64 || top >= self.height as f64 {
+            return None;
+        }
+        Some((
+            left.floor().max(0.0) as usize,
+            right.ceil().min((self.width - 1) as f64) as usize,
+            top.floor().max(0.0) as usize,
+            bottom.ceil().min((self.height - 1) as f64) as usize,
+        ))
+    }
+
+    fn world(&self, point: Vec3) -> Vec3 {
+        self.pose.rotate(point).plus(self.pose.offset)
+    }
+
+    fn camera(&self) -> Vec3 {
+        self.pose
+            .unrotate(Vec3::new(0.0, 0.9, -28.0).minus(self.pose.offset))
+    }
+
+    fn ray(&self, x: usize, y: usize) -> Vec3 {
+        self.pose.unrotate(Vec3::new(
+            (x as f64 - self.width as f64 * 0.5) / (self.scale * 28.0),
+            -(y as f64 - self.height as f64 * 0.5) / (self.scale * self.vertical_scale * 28.0),
+            1.0,
+        ))
+    }
+
+    /// Analytic surface intersections fill every covered cell without sampling holes.
     fn ellipsoid(&mut self, center: Vec3, radius: Vec3, material: Material) {
         let largest = radius.x.max(radius.y).max(radius.z);
-        let rings = ((largest * self.scale * PI).ceil() as usize).clamp(12, 100);
-        let slices = rings * 2;
-        for ring in 0..=rings {
-            let (sp, cp) = (PI * ring as f64 / rings as f64).sin_cos();
-            for slice in 0..slices {
-                let (st, ct) = (TAU * slice as f64 / slices as f64).sin_cos();
-                let unit = Vec3::new(sp * ct, cp, sp * st);
-                self.plot(
-                    center.plus(Vec3::new(
-                        unit.x * radius.x,
-                        unit.y * radius.y,
-                        unit.z * radius.z,
-                    )),
-                    Vec3::new(unit.x / radius.x, unit.y / radius.y, unit.z / radius.z),
-                    material,
+        let extent = Vec3::new(largest, largest, largest);
+        let world = self.world(center);
+        let Some((left, right, top, bottom)) = self.bounds(world.minus(extent), world.plus(extent))
+        else {
+            return;
+        };
+        let origin = self.camera().minus(center);
+        let inverse = Vec3::new(1.0 / radius.x, 1.0 / radius.y, 1.0 / radius.z);
+        let scaled_origin = Vec3::new(
+            origin.x * inverse.x,
+            origin.y * inverse.y,
+            origin.z * inverse.z,
+        );
+        for y in top..=bottom {
+            for x in left..=right {
+                let direction = self.ray(x, y);
+                let scaled_direction = Vec3::new(
+                    direction.x * inverse.x,
+                    direction.y * inverse.y,
+                    direction.z * inverse.z,
                 );
+                let a = scaled_direction.dot(scaled_direction);
+                let b = scaled_origin.dot(scaled_direction);
+                let c = scaled_origin.dot(scaled_origin) - 1.0;
+                let discriminant = b * b - a * c;
+                if discriminant < 0.0 {
+                    continue;
+                }
+                let depth = (-b - discriminant.sqrt()) / a;
+                let hit = origin.plus(direction.scaled(depth));
+                let normal = Vec3::new(
+                    hit.x * inverse.x * inverse.x,
+                    hit.y * inverse.y * inverse.y,
+                    hit.z * inverse.z * inverse.z,
+                );
+                self.store(y * self.width + x, depth, normal, material);
             }
         }
     }
 
-    /// Tapered, round limb with sampled end caps; never a disconnected line of dots.
     fn limb(&mut self, start: Vec3, end: Vec3, start_radius: f64, end_radius: f64) {
+        // Keep narrow feet and fingertips connected on the coarse character grid.
+        // Finer square subpixels need almost no thickness adjustment.
+        let minimum = (0.54 / (self.scale * self.vertical_scale)).min(0.25);
+        self.limb_material(
+            start,
+            end,
+            start_radius.max(minimum),
+            end_radius.max(minimum),
+            Material::Shell,
+        );
+    }
+
+    /// Ray-intersect a tapered segment, then round its joints with small spheres.
+    fn limb_material(
+        &mut self,
+        start: Vec3,
+        end: Vec3,
+        start_radius: f64,
+        end_radius: f64,
+        material: Material,
+    ) {
         let delta = end.minus(start);
-        let axis = delta.normalized();
-        let guide = if axis.y.abs() < 0.9 {
-            Vec3::new(0.0, 1.0, 0.0)
-        } else {
-            Vec3::new(1.0, 0.0, 0.0)
-        };
-        let u = axis.cross(guide).normalized();
-        let v = axis.cross(u).normalized();
-        let steps = ((delta.length() * self.scale * 2.0).ceil() as usize).max(4);
-        let slices =
-            ((TAU * start_radius.max(end_radius) * self.scale * 1.5).ceil() as usize).max(12);
-        for step in 0..=steps {
-            let t = step as f64 / steps as f64;
-            let center = start.plus(delta.scaled(t));
-            let radius = start_radius + (end_radius - start_radius) * t;
-            for slice in 0..slices {
-                let (s, c) = (TAU * slice as f64 / slices as f64).sin_cos();
-                let radial = u.scaled(c).plus(v.scaled(s));
-                let normal = radial.plus(axis.scaled((start_radius - end_radius) / delta.length()));
-                self.plot(center.plus(radial.scaled(radius)), normal, Material::Shell);
+        let length = delta.length();
+        if length < f64::EPSILON {
+            return;
+        }
+        let axis = delta.scaled(1.0 / length);
+        let slope = (end_radius - start_radius) / length;
+        let radius = start_radius.max(end_radius);
+        let a = self.world(start);
+        let b = self.world(end);
+        let low = Vec3::new(
+            a.x.min(b.x) - radius,
+            a.y.min(b.y) - radius,
+            a.z.min(b.z) - radius,
+        );
+        let high = Vec3::new(
+            a.x.max(b.x) + radius,
+            a.y.max(b.y) + radius,
+            a.z.max(b.z) + radius,
+        );
+        if let Some((left, right, top, bottom)) = self.bounds(low, high) {
+            let origin = self.camera().minus(start);
+            let along_origin = origin.dot(axis);
+            let across_origin = origin.minus(axis.scaled(along_origin));
+            let origin_radius = start_radius + slope * along_origin;
+            for y in top..=bottom {
+                for x in left..=right {
+                    let direction = self.ray(x, y);
+                    let along_direction = direction.dot(axis);
+                    let across_direction = direction.minus(axis.scaled(along_direction));
+                    let radius_direction = slope * along_direction;
+                    let qa = across_direction.dot(across_direction)
+                        - radius_direction * radius_direction;
+                    let qb = across_origin.dot(across_direction) - origin_radius * radius_direction;
+                    let qc = across_origin.dot(across_origin) - origin_radius * origin_radius;
+                    let discriminant = qb * qb - qa * qc;
+                    if qa.abs() < 1e-12 || discriminant < 0.0 {
+                        continue;
+                    }
+                    let root = discriminant.sqrt();
+                    let mut depths = [(-qb - root) / qa, (-qb + root) / qa];
+                    depths.sort_by(f64::total_cmp);
+                    for depth in depths {
+                        let along = along_origin + depth * along_direction;
+                        if !(0.0..=length).contains(&along) || depth <= 1.0 {
+                            continue;
+                        }
+                        let hit = origin.plus(direction.scaled(depth));
+                        let radial = hit.minus(axis.scaled(along));
+                        let normal =
+                            radial.minus(axis.scaled(slope * (start_radius + slope * along)));
+                        self.store(y * self.width + x, depth, normal, material);
+                        break;
+                    }
+                }
             }
         }
         for (center, radius) in [(start, start_radius), (end, end_radius)] {
-            self.ellipsoid(center, Vec3::new(radius, radius, radius), Material::Shell);
+            self.ellipsoid(center, Vec3::new(radius, radius, radius), material);
         }
     }
 
     fn crab(&mut self, time: f64) {
-        // Four pairs of legs step in alternating phases. Build them behind the shell.
         for side in [-1.0, 1.0] {
             for leg in 0..4 {
-                let index = leg as f64;
-                let phase = time * 4.8 + index * PI * 0.75 + side * PI * 0.5;
-                let step = phase.sin();
-                let lift = phase.cos().max(0.0) * 0.45;
-                let hip = Vec3::new(side * 3.0, 0.55 - index * 0.52, 0.5);
-                let knee = Vec3::new(
-                    side * (5.1 + index * 0.32),
-                    0.85 - index * 0.83 + step * 0.18,
-                    0.15,
-                );
-                let foot = Vec3::new(
-                    side * (7.5 - index * 0.12 + step * 0.22),
-                    -0.35 - index * 0.88 + lift,
-                    -0.25,
-                );
-                self.limb(hip, knee, 0.26, 0.20);
-                self.limb(knee, foot, 0.20, 0.055);
+                let [hip, knee, ankle, foot] = leg_pose(time, side, leg);
+                self.limb(hip, knee, 0.28, 0.22);
+                self.ellipsoid(knee, Vec3::new(0.29, 0.26, 0.27), Material::Rim);
+                self.limb(knee, ankle, 0.20, 0.13);
+                self.limb(ankle, foot, 0.13, 0.045);
             }
 
-            // Each pincer waves from its shoulder while keeping a visible open gap.
             let wave = (time * 2.4 + side * 1.1).sin();
             let shoulder = Vec3::new(side * 2.7, 0.95, -0.10);
-            let elbow = Vec3::new(side * 4.25, 1.35 + wave * 0.35, -0.25);
-            let palm = Vec3::new(side * 5.05, 2.9 + wave * 0.6, -0.35);
+            let elbow = Vec3::new(side * 4.1, 1.2 + wave * 0.35, -0.35);
+            let palm = Vec3::new(side * 5.05, 2.65 + wave * 0.6, -0.65);
             self.limb(shoulder, elbow, 0.42, 0.34);
+            self.ellipsoid(elbow, Vec3::new(0.43, 0.40, 0.38), Material::Rim);
             self.limb(elbow, palm, 0.34, 0.46);
-            self.ellipsoid(palm, Vec3::new(0.78, 0.8, 0.55), Material::Shell);
-            let opening = 0.12 * (time * 3.2 + side).sin();
-            let inner = palm.plus(Vec3::new(side * (-0.65 - opening), 1.05, 0.0));
-            let outer = palm.plus(Vec3::new(side * (0.82 + opening), 1.05, 0.0));
-            self.limb(
-                palm.plus(Vec3::new(side * -0.38, 0.27, 0.0)),
-                inner,
-                0.37,
-                0.27,
-            );
-            self.limb(
-                inner,
-                palm.plus(Vec3::new(side * -0.25, 1.75, 0.0)),
-                0.27,
-                0.045,
-            );
-            self.limb(
-                palm.plus(Vec3::new(side * 0.42, 0.15, 0.0)),
-                outer,
-                0.42,
-                0.28,
-            );
-            self.limb(
-                outer,
-                palm.plus(Vec3::new(side * 0.35, 1.75, 0.0)),
-                0.28,
-                0.045,
-            );
+            self.ellipsoid(palm, Vec3::new(0.73, 0.79, 0.56), Material::Shell);
+            let opening = 0.68 * (0.5 + 0.5 * (time * 2.8 + side * 0.95).sin());
+            for jaw in [-1.0, 1.0] {
+                let [hinge, bend, tip] = pincer_jaw(palm, jaw, opening);
+                self.ellipsoid(hinge, Vec3::new(0.34, 0.32, 0.34), Material::Rim);
+                self.limb(hinge, bend, 0.34, 0.24);
+                self.limb(bend, tip, 0.24, 0.045);
+            }
         }
 
-        // A broad solid carapace, rather than the old torus with a hole through it.
+        // The lower plate remains visible beneath the domed carapace.
         self.ellipsoid(
-            Vec3::new(0.0, -0.1, 0.0),
-            Vec3::new(3.55, 1.85, 1.45),
+            Vec3::new(0.0, -0.48, 0.05),
+            Vec3::new(3.62, 1.57, 1.25),
+            Material::Underside,
+        );
+        self.ellipsoid(
+            Vec3::new(0.0, 0.12, -0.08),
+            Vec3::new(3.50, 1.72, 1.40),
             Material::Shell,
         );
+
+        // A raised lower rim follows the shell silhouette, not a floating line.
+        let mut previous = None;
+        for step in 0..=40 {
+            let angle = PI + PI * step as f64 / 40.0;
+            let point = Vec3::new(3.50 * angle.cos(), 0.12 + 1.72 * angle.sin(), -0.12);
+            if let Some(start) = previous {
+                self.limb_material(start, point, 0.085, 0.085, Material::Rim);
+            }
+            previous = Some(point);
+        }
+        // Short grooves and the lower seam sit on the shell's curved front.
+        for side in [-1.0, 1.0] {
+            let mut previous = None;
+            for step in 0..=10 {
+                let t = step as f64 / 10.0;
+                let point = shell_front(side * (1.55 + t * 1.38), 0.68 - t * 0.90);
+                if let Some(start) = previous {
+                    self.limb_material(start, point, 0.047, 0.047, Material::Groove);
+                }
+                previous = Some(point);
+            }
+        }
+        let mut previous = None;
+        for step in 0..=36 {
+            let x = -3.0 + 6.0 * step as f64 / 36.0;
+            let y = -0.93 - 0.28 * (1.0 - (x / 3.2).powi(2)).sqrt();
+            let point = shell_front(x, y);
+            if let Some(start) = previous {
+                self.limb_material(start, point, 0.055, 0.055, Material::Groove);
+            }
+            previous = Some(point);
+        }
 
         for side in [-1.0, 1.0] {
             let base = Vec3::new(side * 1.25, 1.2, -0.45);
@@ -315,6 +460,56 @@ impl Renderer {
     }
 }
 
+/// Three articulated segments give each leg a distinct knee and pointed foot.
+fn leg_pose(time: f64, side: f64, leg: usize) -> [Vec3; 4] {
+    let index = leg as f64;
+    let phase = time * 4.8 + index * PI * 0.75 + side * PI * 0.5;
+    let swing = phase.sin();
+    let lift = phase.cos().max(0.0) * 0.50;
+    [
+        Vec3::new(side * 2.85, 0.55 - index * 0.46, 0.40 + index * 0.12),
+        Vec3::new(
+            side * (4.7 + index * 0.30),
+            1.03 - index * 0.88 + swing * 0.16,
+            0.12 + index * 0.22,
+        ),
+        Vec3::new(
+            side * (6.2 + index * 0.18 + swing * 0.25),
+            0.20 - index * 0.90 + lift * 0.5,
+            -0.28 + index * 0.10,
+        ),
+        Vec3::new(
+            side * (7.45 - index * 0.13 + swing * 0.38),
+            -0.24 - index * 1.02 + lift,
+            -0.55 + index * 0.12,
+        ),
+    ]
+}
+
+/// Both jaw tips meet when opening is zero; each rotates about its own hinge.
+fn pincer_jaw(palm: Vec3, jaw: f64, opening: f64) -> [Vec3; 3] {
+    let hinge = palm.plus(Vec3::new(jaw * 0.43, 0.28, 0.0));
+    let angle = -jaw * opening;
+    let (s, c) = angle.sin_cos();
+    let rotate = |point: Vec3| {
+        hinge.plus(Vec3::new(
+            point.x * c - point.y * s,
+            point.x * s + point.y * c,
+            point.z,
+        ))
+    };
+    [
+        hinge,
+        rotate(Vec3::new(jaw * 0.38, 0.85, 0.0)),
+        rotate(Vec3::new(-jaw * 0.43, 1.55, 0.0)),
+    ]
+}
+
+fn shell_front(x: f64, y: f64) -> Vec3 {
+    let inside = 1.0 - (x / 3.50).powi(2) - ((y - 0.12) / 1.72).powi(2);
+    Vec3::new(x, y, -0.08 - 1.40 * inside.max(0.0).sqrt() - 0.035)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +530,7 @@ mod tests {
                         .bytes()
                         .filter(|byte| !byte.is_ascii_whitespace())
                         .count()
-                        > width
+                        > width / 2
                 );
                 assert!(renderer
                     .depth
@@ -408,6 +603,61 @@ mod tests {
         }
         // The complete silhouette visibly travels across the terminal.
         assert!(rightmost - leftmost >= 8);
+    }
+
+    #[test]
+    fn hinged_jaws_close_and_open_at_the_tips() {
+        let palm = Vec3::new(0.0, 0.0, 0.0);
+        let closed_left = pincer_jaw(palm, -1.0, 0.0);
+        let closed_right = pincer_jaw(palm, 1.0, 0.0);
+        let open_left = pincer_jaw(palm, -1.0, 0.68);
+        let open_right = pincer_jaw(palm, 1.0, 0.68);
+        assert!(closed_left[2].minus(closed_right[2]).length() < 1e-9);
+        assert!(open_left[2].minus(open_right[2]).length() > 2.0);
+        assert!(open_left[0].minus(closed_left[0]).length() < 1e-9);
+        assert!(open_right[0].minus(closed_right[0]).length() < 1e-9);
+    }
+
+    #[test]
+    fn eight_legs_step_independently_with_visible_joints() {
+        for side in [-1.0, 1.0] {
+            for leg in 0..4 {
+                let first = leg_pose(0.0, side, leg);
+                let next = leg_pose(0.25, side, leg);
+                for pair in first.windows(2) {
+                    assert!(pair[1].minus(pair[0]).length() > 0.5);
+                }
+                assert!(first[3].minus(next[3]).length() > 0.1);
+                if leg > 0 {
+                    assert!((first[3].y - leg_pose(0.0, side, leg - 1)[3].y).abs() > 0.45);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn square_subpixels_fill_surfaces_without_sampling_holes() {
+        let mut renderer = Renderer::with_aspect(400, 256, 1.0);
+        renderer.ellipsoid(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(3.5, 1.7, 1.4),
+            Material::Shell,
+        );
+        for row in renderer.pixels.chunks(renderer.width) {
+            if let (Some(left), Some(right)) = (
+                row.iter().position(|c| *c != b' '),
+                row.iter().rposition(|c| *c != b' '),
+            ) {
+                assert!(row[left..=right].iter().all(|c| *c != b' '));
+            }
+        }
+        let frame = renderer.render(1.5);
+        assert_eq!(frame.lines().count(), 256);
+        assert!(frame.lines().all(|line| line.len() == 400));
+        assert!(renderer
+            .depth
+            .iter()
+            .all(|depth| depth.is_infinite() || depth.is_finite() && *depth > 1.0));
     }
 
     #[test]
