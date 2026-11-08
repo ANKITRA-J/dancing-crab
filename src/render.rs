@@ -69,7 +69,7 @@ impl Pose {
         Self {
             yaw: (0.28 * (time * 0.85).sin()).sin_cos(),
             roll: (0.07 * (time * 2.4).sin()).sin_cos(),
-            offset: Vec3::new(0.45 * (time * 1.2).sin(), 0.20 * (time * 4.8).sin(), 0.0),
+            offset: Vec3::new(1.3 * (time * 1.2).sin(), 0.20 * (time * 4.8).sin(), 0.0),
         }
     }
 
@@ -87,6 +87,7 @@ enum Material {
     Shell,
     Eye,
     Pupil,
+    ClosedEye,
 }
 
 /// Reusable ASCII canvas. No terminal control codes are emitted by this module.
@@ -105,7 +106,7 @@ impl Renderer {
         Self {
             width,
             height,
-            scale: ((width.saturating_sub(2) as f64) / 18.5)
+            scale: ((width.saturating_sub(2) as f64) / 20.5)
                 .min((height.saturating_sub(2) as f64) * 2.0 / 12.0),
             pixels: vec![b' '; width * height],
             depth: vec![f64::INFINITY; width * height],
@@ -164,7 +165,8 @@ impl Renderer {
                 SHADES[(brightness * (SHADES.len() - 1) as f64).round() as usize]
             }
             Material::Eye => b'O',
-            Material::Pupil => b'@',
+            Material::Pupil => b'o',
+            Material::ClosedEye => b'_',
         };
         self.depth[index] = depth;
         self.pixels[index] = shade;
@@ -291,14 +293,24 @@ impl Renderer {
 
         for side in [-1.0, 1.0] {
             let base = Vec3::new(side * 1.25, 1.2, -0.45);
-            let eye = Vec3::new(side * 1.38, 2.5, -0.75);
-            self.limb(base, eye, 0.17, 0.17);
-            self.ellipsoid(eye, Vec3::new(0.48, 0.52, 0.43), Material::Eye);
-            self.ellipsoid(
-                eye.plus(Vec3::new(0.03 * (time * 1.2).sin(), 0.0, -0.38)),
-                Vec3::new(0.16, 0.24, 0.1),
-                Material::Pupil,
+            // Stalks waggle out of phase, independently of the shell and claws.
+            let eye = Vec3::new(
+                side * 1.38 + 0.27 * (time * 2.2 + side * 1.1).sin(),
+                2.65 + 0.32 * (time * 2.8 + side * 0.9).sin(),
+                -0.75,
             );
+            self.limb(base, eye, 0.17, 0.17);
+            let blink = (time - side * 0.025).rem_euclid(5.2);
+            if (4.0..4.18).contains(&blink) {
+                self.ellipsoid(eye, Vec3::new(0.55, 0.09, 0.44), Material::ClosedEye);
+            } else {
+                self.ellipsoid(eye, Vec3::new(0.54, 0.58, 0.45), Material::Eye);
+                self.ellipsoid(
+                    eye.plus(Vec3::new(0.14 * (time * 1.5).sin(), 0.0, -0.40)),
+                    Vec3::new(0.19, 0.28, 0.1),
+                    Material::Pupil,
+                );
+            }
         }
     }
 }
@@ -338,9 +350,64 @@ mod tests {
         let mut renderer = Renderer::new(100, 32);
         let first = renderer.render(0.0);
         assert!(first.contains('O'));
-        assert!(first.matches('@').count() >= 2);
+        assert!(first.matches('o').count() >= 2);
         assert_ne!(first, renderer.render(0.5));
         assert_ne!(renderer.render(0.5), renderer.render(1.0));
+
+        let eye_height_difference = |frame: &str| {
+            let eyes: Vec<_> = frame
+                .lines()
+                .enumerate()
+                .flat_map(|(y, line)| line.bytes().enumerate().map(move |(x, byte)| (x, y, byte)))
+                .filter(|(_, _, byte)| matches!(byte, b'O' | b'o'))
+                .collect();
+            let middle = (eyes.iter().map(|p| p.0).min().unwrap()
+                + eyes.iter().map(|p| p.0).max().unwrap()) as f64
+                / 2.0;
+            let mean_y = |left: bool| {
+                let group: Vec<_> = eyes
+                    .iter()
+                    .filter(|p| ((p.0 as f64) < middle) == left)
+                    .collect();
+                group.iter().map(|p| p.1 as f64).sum::<f64>() / group.len() as f64
+            };
+            mean_y(true) - mean_y(false)
+        };
+        // Eye stalks change their height relative to each other as they waggle.
+        assert!(
+            (eye_height_difference(&first) - eye_height_difference(&renderer.render(0.7))).abs()
+                > 1.0
+        );
+    }
+
+    #[test]
+    fn eyes_blink_and_scuttle_stays_inside_the_canvas() {
+        let mut renderer = Renderer::new(100, 32);
+        let awake = renderer.render(0.0);
+        assert!(awake.contains('O') && awake.contains('o'));
+        let blinking = renderer.render(4.08);
+        assert!(blinking.contains('_'));
+        assert!(!blinking.contains('O') && !blinking.contains('o'));
+        let awake_again = renderer.render(4.3);
+        assert!(awake_again.contains('O') && awake_again.contains('o'));
+
+        let mut leftmost = usize::MAX;
+        let mut rightmost = 0;
+        for index in 0..120 {
+            let frame = renderer.render(index as f64 / 10.0);
+            let occupied: Vec<_> = frame
+                .lines()
+                .flat_map(|line| line.bytes().enumerate())
+                .filter_map(|(x, byte)| (byte != b' ').then_some(x))
+                .collect();
+            let left = *occupied.iter().min().unwrap();
+            let right = *occupied.iter().max().unwrap();
+            assert!(left > 0 && right < 99, "crab clipped at frame {index}");
+            leftmost = leftmost.min(left);
+            rightmost = rightmost.max(left);
+        }
+        // The complete silhouette visibly travels across the terminal.
+        assert!(rightmost - leftmost >= 8);
     }
 
     #[test]

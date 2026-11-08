@@ -7,6 +7,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
+    style::{Color, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use render::Renderer;
@@ -16,6 +17,7 @@ const HELP: &str = "Dancing Crab - a shaded 3D ASCII crab in your terminal
 Usage: dancing-crab [OPTIONS]
 
   --snapshot        Print one plain ASCII frame and exit
+  --no-color        Disable orange terminal colors (also respects NO_COLOR)
   --time SECONDS    Starting animation time (default: 0)
   --width COLUMNS   Canvas width, 20..400 (default: fit terminal, or 100)
   --height ROWS     Canvas height, 8..120 (default: fit terminal, or 32)
@@ -30,6 +32,7 @@ When output or input is not a terminal, print one plain frame by default.
 #[derive(Debug)]
 struct Options {
     snapshot: bool,
+    no_color: bool,
     time: f64,
     width: Option<usize>,
     height: Option<usize>,
@@ -41,6 +44,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             snapshot: false,
+            no_color: false,
             time: 0.0,
             width: None,
             height: None,
@@ -59,6 +63,10 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Option
         }
         if arg == "--snapshot" {
             options.snapshot = true;
+            continue;
+        }
+        if arg == "--no-color" {
+            options.no_color = true;
             continue;
         }
         if !matches!(
@@ -107,7 +115,7 @@ impl Terminal {
 
 fn restore_terminal() {
     let _ = terminal::disable_raw_mode();
-    let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), ResetColor, Show, LeaveAlternateScreen);
 }
 
 impl Drop for Terminal {
@@ -124,6 +132,45 @@ fn write_line(out: &mut impl Write, row: u16, text: &str, columns: u16) -> io::R
     queue!(out, Clear(ClearType::UntilNewLine))
 }
 
+fn crab_color(cell: u8) -> Color {
+    let (r, g, b) = match cell {
+        b'O' | b'_' => (255, 244, 225),
+        b'o' => (90, 52, 37),
+        b'.' | b',' | b'-' | b'~' => (166, 57, 9),
+        b':' | b';' | b'=' => (215, 68, 8),
+        b'!' | b'*' | b'#' => (247, 76, 0),
+        b'$' | b'@' => (255, 151, 64),
+        _ => return Color::Reset,
+    };
+    Color::Rgb { r, g, b }
+}
+
+fn write_crab_line(
+    out: &mut impl Write,
+    row: u16,
+    text: &str,
+    columns: u16,
+    color: bool,
+) -> io::Result<()> {
+    if !color {
+        return write_line(out, row, text, columns);
+    }
+    queue!(out, MoveTo(0, row))?;
+    let cells = &text.as_bytes()[..text.len().min(columns.saturating_sub(1) as usize)];
+    let mut start = 0;
+    while start < cells.len() {
+        let shade = crab_color(cells[start]);
+        let mut end = start + 1;
+        while end < cells.len() && crab_color(cells[end]) == shade {
+            end += 1;
+        }
+        queue!(out, SetForegroundColor(shade))?;
+        out.write_all(&cells[start..end])?;
+        start = end;
+    }
+    queue!(out, ResetColor, Clear(ClearType::UntilNewLine))
+}
+
 fn animate(options: &Options) -> io::Result<()> {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -134,6 +181,7 @@ fn animate(options: &Options) -> io::Result<()> {
     let mut out = stdout.lock();
     let _terminal = Terminal::enter(&mut out)?;
     let tick = Duration::from_secs_f64(1.0 / f64::from(options.fps));
+    let color = !options.no_color && std::env::var_os("NO_COLOR").is_none();
     let mut time = options.time;
     let mut last_tick = Instant::now();
     let mut paused = false;
@@ -165,7 +213,7 @@ fn animate(options: &Options) -> io::Result<()> {
         } else {
             write_line(&mut out, 0, "D A N C I N G   C R A B", columns)?;
             for (y, line) in renderer.render(time).lines().enumerate() {
-                write_line(&mut out, y as u16 + 1, line, columns)?;
+                write_crab_line(&mut out, y as u16 + 1, line, columns, color)?;
             }
             let footer = if paused {
                 "PAUSED | Space: resume | Q / Esc / Ctrl+C: quit"
